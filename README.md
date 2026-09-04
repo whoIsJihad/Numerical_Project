@@ -38,6 +38,25 @@ GitHub runs the same test suite for pull requests.
 
 ## Shared interfaces
 
+### Reading the types (similar to C++ signatures)
+
+`def thermal_voltage(temperature_k: float) -> float` takes a floating-point
+temperature and returns a floating-point voltage. `-> None` means no return value
+(like `void`). `float | None` means a float or an explicitly missing value.
+
+`Array` means a NumPy `float64` array, not a Python list. Each function's docstring
+specifies its shape: `(N,)` is N numbers; `(N,5)` is N rows and five columns.
+`Bounds` is a tuple `(lower, upper)` of arrays. `Callable` types specify functions
+passed as arguments. `Literal` types list the accepted method names.
+
+Return types such as `FitResult` are `TypedDict` declarations beside their owning
+functions: they list required dictionary keys and the exact value types. They are
+still ordinary dictionaries, accessed as `result["converged"]`, not C++ objects.
+
+Annotations help type-aware editors/static checkers find mismatches; **Python does
+not enforce them at runtime**. Shapes, units, positivity and finite values still
+need validation and numerical tests. No extra module or framework is required.
+
 All functions are documented in their files. Use NumPy arrays and ordinary dictionaries;
 there is no separate configuration framework.
 
