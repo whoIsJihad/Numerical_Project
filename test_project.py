@@ -1,139 +1,149 @@
-"""Shared tests: edit your labelled section; replace placeholders and remove their skips."""
+"""Tests for the complete PV parameter-estimation pipeline."""
 
-from importlib import import_module
-from inspect import isfunction, signature
-from typing import get_type_hints
+from pathlib import Path
 
+import numpy as np
 import pytest
 
-
-@pytest.mark.parametrize(
-    "module", ["model", "current", "fit", "numerics", "experiments", "run"]
+from current import solve_currents, solve_root
+from experiments import add_noise, plot_fit, rmse
+from fit import fit_parameters
+from model import (
+    equation,
+    initial_parameters,
+    load_data,
+    thermal_voltage,
+    validate_data,
 )
-def test_scaffold_imports(module: str) -> None:
-    """Importability is not numerical correctness."""
-    assert import_module(module) is not None
+from numerics import jacobian, residuals, solve_linear
 
 
-@pytest.mark.parametrize(
-    "module", ["model", "current", "fit", "numerics", "experiments", "run"]
-)
-def test_scaffold_annotations(module: str) -> None:
-    """All public functions declare resolvable parameter and return types."""
-    imported = import_module(module)
-    for value in vars(imported).values():
-        if isfunction(value) and value.__module__ == module:
-            hints = get_type_hints(value)
-            assert "return" in hints
-            assert set(signature(value).parameters) <= hints.keys()
+def sample_problem() -> tuple:
+    """Return a small exact I-V curve used by several tests."""
+    voltage = np.linspace(0.0, 0.55, 12)
+    theta = np.array([0.76079, 0.31069e-6, 0.03655, 52.88991, 1.47727])
+    vt = thermal_voltage(306.15)
+    current = solve_currents(voltage, theta, vt)["current"]
+    lower = np.array([0.0, 1e-12, 0.0, 1.0, 1.0])
+    upper = np.array([1.0, 1e-6, 0.5, 100.0, 2.0])
+    scales = np.array([1.0, 1e-6, 0.1, 50.0, 1.0])
+    return voltage, current, theta, vt, (lower, upper), scales
 
 
-# Member 1
+def test_load_and_validate_data(tmp_path: Path) -> None:
+    """The CSV loader separates the two named columns and rejects bad data."""
+    csv_path = tmp_path / "small.csv"
+    csv_path.write_text("voltage_v,current_a\n0.0,0.8\n0.5,0.2\n")
+    voltage, current = load_data(csv_path)
+    assert np.array_equal(voltage, [0.0, 0.5])
+    assert np.array_equal(current, [0.8, 0.2])
+    with pytest.raises(ValueError):
+        validate_data(np.array([0.0]), np.array([0.8, 0.2]))
 
 
-@pytest.mark.skip(reason="Member 1: implement this acceptance test and component")
-def test_equation() -> None:
-    """With Rs=0, use the direct current expression and verify the checker is zero."""
-    raise NotImplementedError("Member 1: replace with real assertions")
+def test_model_equation_and_derivative() -> None:
+    """A solved current balances the equation and the derivative matches a small difference."""
+    voltage, current, theta, vt, _, _ = sample_problem()
+    assert abs(equation(float(current[4]), float(voltage[4]), theta, vt)) < 1e-8
+    step = 1e-6
+    numerical_slope = (
+        equation(float(current[4] + step), float(voltage[4]), theta, vt)
+        - equation(float(current[4] - step), float(voltage[4]), theta, vt)
+    ) / (2 * step)
+    from model import current_derivative
+
+    assert current_derivative(
+        float(current[4]), float(voltage[4]), theta, vt
+    ) == pytest.approx(numerical_slope, rel=1e-6)
 
 
-@pytest.mark.skip(reason="Member 1: implement this acceptance test and component")
-def test_model_and_data() -> None:
-    """Check current derivative by central differences, vt/Ns, CSV order and invalid data."""
-    raise NotImplementedError("Member 1: replace with real assertions")
+def test_starting_parameters() -> None:
+    """Starting values have five entries and lie inside their limits."""
+    voltage, current, _, vt, _, _ = sample_problem()
+    theta0, bounds, scales = initial_parameters(voltage, current, vt)
+    assert theta0.shape == bounds[0].shape == bounds[1].shape == scales.shape == (5,)
+    assert np.all(theta0 >= bounds[0]) and np.all(theta0 <= bounds[1])
 
 
-@pytest.mark.skip(reason="Member 1: implement this acceptance test and component")
-def test_parameters() -> None:
-    """Check physical domains, finite bounds and feasible initial theta/scales."""
-    raise NotImplementedError("Member 1: replace with real assertions")
+def test_all_root_methods() -> None:
+    """Newton, bisection, and hybrid all solve the same PV current."""
+    voltage, _, theta, vt, _, _ = sample_problem()
+    answers = [
+        solve_root(float(voltage[5]), theta, vt, initial_guess=0.7, method="newton"),
+        solve_root(
+            float(voltage[5]), theta, vt, bracket=(-0.5, 1.5), method="bisection"
+        ),
+        solve_root(
+            float(voltage[5]),
+            theta,
+            vt,
+            initial_guess=0.7,
+            bracket=(-0.5, 1.5),
+            method="hybrid",
+        ),
+    ]
+    assert all(answer["converged"] for answer in answers)
+    assert (
+        max(answer["root"] for answer in answers)
+        - min(answer["root"] for answer in answers)
+        < 1e-7
+    )
 
 
-@pytest.mark.skip(reason="Member 1: implement this acceptance test and component")
-def test_baseline() -> None:
-    """Test callback wiring and synthetic fit improvement; failed fit must have rmse=None."""
-    raise NotImplementedError("Member 1: replace with real assertions")
+def test_current_curve_keeps_input_order() -> None:
+    """Calculated currents line up with unsorted and repeated voltages."""
+    _, _, theta, vt, _, _ = sample_problem()
+    voltage = np.array([0.4, 0.0, 0.4])
+    result = solve_currents(voltage, theta, vt)
+    assert np.all(np.isfinite(result["current"]))
+    assert result["current"][0] == pytest.approx(result["current"][2])
+    assert len(result["roots"]) == 3
 
 
-# Member 2
+def test_residuals_and_jacobian() -> None:
+    """Exact data has tiny errors and the Jacobian has 12 rows by 5 columns."""
+    voltage, current, theta, vt, bounds, scales = sample_problem()
+    errors = residuals(theta, voltage, current, vt)
+    table = jacobian(theta, voltage, current, vt, bounds, scales)
+    assert np.max(np.abs(errors)) < 1e-8
+    assert table.shape == (12, 5)
+    assert np.all(np.isfinite(table))
 
 
-@pytest.mark.skip(reason="Member 2: implement this acceptance test and component")
-def test_root_methods() -> None:
-    """Test known roots for Newton/bisection/hybrid, including endpoint and fallback cases."""
-    raise NotImplementedError("Member 2: replace with real assertions")
+def test_gaussian_elimination() -> None:
+    """Row swapping solves a system whose first diagonal entry is zero."""
+    matrix = np.array([[0.0, 2.0], [1.0, 3.0]])
+    rhs = np.array([4.0, 7.0])
+    assert np.allclose(solve_linear(matrix, rhs), [1.0, 2.0])
+    with pytest.raises(RuntimeError):
+        solve_linear(np.array([[1.0, 2.0], [2.0, 4.0]]), np.array([1.0, 2.0]))
 
 
-@pytest.mark.skip(reason="Member 2: implement this acceptance test and component")
-def test_root_failures() -> None:
-    """Bad bracket, zero derivative, nonfinite evaluation and limit: no false success."""
-    raise NotImplementedError("Member 2: replace with real assertions")
+def test_parameter_fit_reduces_error() -> None:
+    """LM improves a nearby starting guess without changing that input array."""
+    voltage, current, _, vt, bounds, scales = sample_problem()
+    theta0 = np.array([0.75, 0.4e-6, 0.05, 50.0, 1.5])
+    original = theta0.copy()
+    result = fit_parameters(voltage, current, vt, theta0, bounds, scales, max_iter=30)
+    assert result["converged"]
+    assert result["history"][-1] < result["history"][0]
+    assert np.array_equal(theta0, original)
 
 
-@pytest.mark.skip(reason="Member 2: implement this acceptance test and component")
-def test_current_curve() -> None:
-    """Check equation balance, unsorted/duplicate voltages, failed points and warm starts."""
-    raise NotImplementedError("Member 2: replace with real assertions")
+def test_error_and_noise_helpers() -> None:
+    """RMSE and seeded noise produce known, repeatable results."""
+    assert rmse(np.array([-3.0, 4.0])) == pytest.approx(np.sqrt(12.5))
+    current = np.array([1.0, 2.0, 3.0])
+    first = add_noise(current, 0.1, np.random.default_rng(42))
+    second = add_noise(current, 0.1, np.random.default_rng(42))
+    assert np.array_equal(first, second)
+    assert np.array_equal(current, [1.0, 2.0, 3.0])
 
 
-# Member 3
-
-
-@pytest.mark.skip(reason="Member 3: implement this acceptance test and component")
-def test_fit_known_solution() -> None:
-    """Use a known linear residual for GN and a small nonlinear callback for LM."""
-    raise NotImplementedError("Member 3: replace with real assertions")
-
-
-@pytest.mark.skip(reason="Member 3: implement this acceptance test and component")
-def test_fit_bounds_failures() -> None:
-    """Check bounds, failed start/trials, singularity and iteration-limit status."""
-    raise NotImplementedError("Member 3: replace with real assertions")
-
-
-@pytest.mark.skip(reason="Member 3: implement this acceptance test and component")
-def test_fit_diagnostics() -> None:
-    """Check evaluation counts, accepted history, unchanged inputs; propagate NotImplementedError."""
-    raise NotImplementedError("Member 3: replace with real assertions")
-
-
-# Member 4
-
-
-@pytest.mark.skip(reason="Member 4: implement this acceptance test and component")
-def test_residuals() -> None:
-    """Stub predictions; check sign/order/shape and rejection of any failed root."""
-    raise NotImplementedError("Member 4: replace with real assertions")
-
-
-@pytest.mark.skip(reason="Member 4: implement this acceptance test and component")
-def test_jacobian() -> None:
-    """Match analytic toy derivatives; test tiny scales, bound-aware steps and failed evaluations."""
-    raise NotImplementedError("Member 4: replace with real assertions")
-
-
-@pytest.mark.skip(reason="Member 4: implement this acceptance test and component")
-def test_linear_solve() -> None:
-    """A=[[0,2],[1,3]], b=[4,7] gives [1,2]; test singular/invalid systems and no mutation."""
-    raise NotImplementedError("Member 4: replace with real assertions")
-
-
-# Member 5
-
-
-@pytest.mark.skip(reason="Member 5: implement this acceptance test and component")
-def test_metrics_noise() -> None:
-    """RMSE([-3,4])=sqrt(12.5); test same seeds, sigma=0 and no mutation."""
-    raise NotImplementedError("Member 5: replace with real assertions")
-
-
-@pytest.mark.skip(reason="Member 5: implement this acceptance test and component")
-def test_monte_carlo() -> None:
-    """Fake fits retain failures; test zero/one-success summaries and seeded repeatability."""
-    raise NotImplementedError("Member 5: replace with real assertions")
-
-
-@pytest.mark.skip(reason="Member 5: implement this acceptance test and component")
-def test_reports() -> None:
-    """Check strict JSON metadata and a labelled plot saved to a temporary path."""
-    raise NotImplementedError("Member 5: replace with real assertions")
+def test_plot(tmp_path: Path) -> None:
+    """The plot helper writes a nonempty image file."""
+    voltage = np.array([0.0, 0.5])
+    current = np.array([0.8, 0.2])
+    path = tmp_path / "curve.png"
+    plot_fit(voltage, current, current, path)
+    assert path.exists() and path.stat().st_size > 0

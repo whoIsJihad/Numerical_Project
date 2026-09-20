@@ -1,121 +1,143 @@
-"""Member 5: metrics, reproducible noise experiments and reporting."""
+"""Error measurements, noise experiments, result files, and plots."""
 
-from collections.abc import Callable
+import json
 from pathlib import Path
-from typing import TypeAlias, TypedDict
 
-from numpy.random import Generator
+import matplotlib.pyplot as plt
+import numpy as np
 
-from fit import FitResult
-from model import Array
-
-FitFunction: TypeAlias = Callable[[Array, Array], FitResult]  # voltage/current (N,)
+from fit import fit_parameters
+from model import validate_data, validate_parameters
 
 
-class MonteCarloResult(TypedDict):
-    seed: int
-    sigma: float  # current-noise standard deviation [A]
-    trials: list[FitResult]  # length repeats, including failures
+def convert_json_value(value: object) -> object:
+    """Convert a NumPy value into something the JSON writer understands."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"cannot save {type(value).__name__} as JSON")
 
 
-class Summary(TypedDict):
-    successes: int
-    failures: int
-    failure_rate: float
-    mean_rmse: float | None  # [A], None when no successes
-    parameter_mean: Array | None  # (5,), None when no successes
-    parameter_std: Array | None  # (5,), None with fewer than two successes
+def rmse(errors: np.ndarray) -> float:
+    """Return one number describing the typical size of the current errors."""
+    if not isinstance(errors, np.ndarray) or errors.ndim != 1 or errors.size == 0:
+        raise ValueError("errors must be a nonempty one-dimensional NumPy array")
+    if not np.all(np.isfinite(errors)):
+        raise ValueError("errors cannot contain NaN or infinity")
+    return float(np.sqrt(np.mean(errors**2)))
 
 
-class ResultMetadata(TypedDict):
-    """Required provenance/settings for export."""
-
-    source: str  # dataset citation or URL
-    temperature_k: float
-    ns: int
-    theta0: Array  # (5,)
-    settings: dict[str, str | int | float | bool]  # named scalar solver settings
-
-
-def rmse(residuals: Array) -> float:
-    """Return sqrt(mean(residuals**2)); reject empty, nonfinite or non-1-D input.
-
-    Inputs: Finite residuals (N,) [A], N > 0.
-    Returns: Scalar RMSE [A].
-    """
-    raise NotImplementedError("Member 5: RMSE")
-
-
-def add_noise(current: Array, sigma: float, rng: Generator) -> Array:
-    """Return a new current array with independent Gaussian noise.
-
-    Sigma is a finite nonnegative standard deviation in A. Use the supplied
-    numpy Generator, never reset it or mutate the original current.
-
-
-    Inputs: Finite current (N,) [A], finite sigma >= 0 [A], NumPy Generator.
-    Returns: New noisy current array (N,) [A].
-    """
-    raise NotImplementedError("Member 5: current noise")
+def add_noise(
+    current: np.ndarray, sigma: float, rng: np.random.Generator
+) -> np.ndarray:
+    """Return a copy of the current measurements with Gaussian noise added."""
+    if not isinstance(current, np.ndarray) or current.ndim != 1 or current.size == 0:
+        raise ValueError("current must be a nonempty one-dimensional NumPy array")
+    if not np.all(np.isfinite(current)) or not np.isfinite(sigma) or sigma < 0:
+        raise ValueError("current must be finite and sigma cannot be negative")
+    return current + rng.normal(0.0, sigma, size=current.size)
 
 
 def monte_carlo(
-    voltage: Array,
-    current: Array,
-    fit_fn: FitFunction,
+    voltage: np.ndarray,
+    current: np.ndarray,
+    vt: float,
+    theta0: np.ndarray,
+    bounds: tuple[np.ndarray, np.ndarray],
+    scales: np.ndarray,
     sigma: float,
     repeats: int = 100,
     seed: int = 42,
-) -> MonteCarloResult:
-    """Return {"seed": seed, "sigma": sigma, "trials": list of fit dictionaries}.
+    ns: int = 1,
+    root_method: str = "hybrid",
+    fit_method: str = "lm",
+) -> dict:
+    """Add noise and repeat the full parameter fit a chosen number of times."""
+    validate_data(voltage, current)
+    validate_parameters(theta0, bounds)
+    if not isinstance(repeats, int) or repeats < 1:
+        raise ValueError("repeats must be a positive integer")
+    if not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a nonnegative integer")
 
-    fit_fn(voltage, noisy_current) returns a fit_parameters result; the callback
-    closes over identical starting parameters/settings for every trial.
-    Use one default_rng(seed) stream. Keep every failed and successful fit;
-    propagate programming errors. Validate repeats is a positive integer.
-
-
-    Inputs: voltage/current (N,) [V/A], callback (voltage,current)->FitResult,
-    finite sigma >= 0 [A], integer repeats > 0, nonnegative integer seed.
-    Returns: MonteCarloResult containing exactly repeats trials.
-    """
-    raise NotImplementedError("Member 5: Monte Carlo")
-
-
-def summarize(result: MonteCarloResult) -> Summary:
-    """Return successes/failures/failure_rate/mean_rmse/parameter_mean/parameter_std.
-
-    Failure rate uses all trials; other statistics use converged trials only.
-    No successes: None for fit statistics. Sample std needs at least two successes.
-
-
-    Inputs: Nonempty MonteCarloResult of five-parameter PV fits.
-    Returns: Summary with the fields declared above; None for unavailable statistics.
-    """
-    raise NotImplementedError("Member 5: summary")
-
-
-def save_results(
-    result: MonteCarloResult, path: str | Path, metadata: ResultMetadata
-) -> None:
-    """Write strict JSON including seed, settings and dataset provenance.
-
-    Convert arrays; use null for missing statistics, not NaN. Include temperature,
-    series-cell count and initial parameters in metadata. Propagate I/O errors.
+    generator = np.random.default_rng(seed)
+    trials = []
+    for _ in range(repeats):
+        noisy_current = add_noise(current, sigma, generator)
+        trial = fit_parameters(
+            voltage,
+            noisy_current,
+            vt,
+            theta0,
+            bounds,
+            scales,
+            ns,
+            root_method,
+            fit_method,
+        )
+        trials.append(trial)
+    return {"seed": seed, "sigma": sigma, "trials": trials}
 
 
-    Inputs: MonteCarloResult, destination JSON path, required ResultMetadata fields.
-    Returns: None; writes a file. File errors propagate.
-    """
-    raise NotImplementedError("Member 5: export")
+def summarize(result: dict) -> dict:
+    """Summarize convergence, RMSE, and fitted parameters across all trials."""
+    trials = result.get("trials", [])
+    if not trials:
+        raise ValueError("result must contain at least one trial")
+    successful = [trial for trial in trials if trial["converged"]]
+    failures = len(trials) - len(successful)
+    if not successful:
+        return {
+            "successes": 0,
+            "failures": failures,
+            "failure_rate": 1.0,
+            "mean_rmse": None,
+            "parameter_mean": None,
+            "parameter_std": None,
+        }
+
+    parameters = np.array([trial["theta"] for trial in successful])
+    errors = [rmse(trial["residuals"]) for trial in successful]
+    parameter_std = None
+    if len(successful) > 1:
+        parameter_std = np.std(parameters, axis=0, ddof=1)
+    return {
+        "successes": len(successful),
+        "failures": failures,
+        "failure_rate": failures / len(trials),
+        "mean_rmse": float(np.mean(errors)),
+        "parameter_mean": np.mean(parameters, axis=0),
+        "parameter_std": parameter_std,
+    }
+
+
+def save_results(result: dict, path: str | Path, metadata: dict) -> None:
+    """Save the experiment, its summary, and dataset information as JSON."""
+    output = {"metadata": metadata, "result": result, "summary": summarize(result)}
+
+    with Path(path).open("w", encoding="utf-8") as file:
+        json.dump(output, file, indent=2, allow_nan=False, default=convert_json_value)
 
 
 def plot_fit(
-    voltage: Array, measured_current: Array, predicted_current: Array, path: str | Path
+    voltage: np.ndarray,
+    measured_current: np.ndarray,
+    calculated_current: np.ndarray,
+    path: str | Path,
 ) -> None:
-    """Save a labelled I-V plot in volts/amperes; reject mismatched/nonfinite arrays.
-
-    Inputs: Matching finite (N,) arrays: voltage [V], both currents [A]; destination image path.
-    Returns: None; saves a figure.
-    """
-    raise NotImplementedError("Member 5: plot")
+    """Save a graph comparing the measured and calculated I-V curves."""
+    validate_data(voltage, measured_current)
+    validate_data(voltage, calculated_current)
+    figure, axes = plt.subplots()
+    axes.scatter(voltage, measured_current, label="Measured", color="black")
+    order = np.argsort(voltage)
+    axes.plot(voltage[order], calculated_current[order], label="Calculated")
+    axes.set_xlabel("Voltage (V)")
+    axes.set_ylabel("Current (A)")
+    axes.set_title("PV current-voltage curve")
+    axes.legend()
+    axes.grid(True, alpha=0.3)
+    figure.tight_layout()
+    figure.savefig(path)
+    plt.close(figure)

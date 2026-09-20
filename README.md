@@ -8,16 +8,16 @@ functions are intentionally unimplemented.** Start with one single-cell dataset.
 | File | Owner | Responsibility |
 | --- | --- | --- |
 | `model.py` | Member 1 | PV equation/derivative, CSV loading, validation, initial parameters |
-| `current.py` | Member 2 | Newton, bisection, hybrid solver and current prediction |
+| `current.py` | Member 2 | Newton, bisection, hybrid solver and current calculation |
 | `fit.py` | Member 3 | Gauss–Newton and Levenberg–Marquardt parameter fitting |
 | `numerics.py` | Member 4 | Residuals, finite-difference Jacobian, pivoted linear solve |
 | `experiments.py` | Member 5 | RMSE, seeded noise studies, summaries and plots |
 | `run.py` | Member 1 | Connect the components and provide the entry point |
 | `test_project.py` | Everyone | Implement the tests labelled with your member number |
 
-Measurements → predict currents → residuals → update parameters → repeat.
+Measurements → solve currents → residuals → update parameters → repeat.
 The **inner solver changes current** with parameters fixed.
-The **outer optimizer changes parameters** and repeats the current predictions.
+The **outer optimizer changes parameters** and repeats the current calculations.
 
 ## Setup
 
@@ -36,29 +36,18 @@ If the folder moved, recreate the virtual environment before activation.
 Scaffold checks only test imports; skipped tests are unfinished, not passing algorithms.
 GitHub runs the same test suite for pull requests.
 
-## Shared interfaces
+## How data moves through the program
 
-### Reading the types (similar to C++ signatures)
+`run.py` loads voltage and measured current from the CSV, creates a starting
+parameter array, and passes those values directly to `fit_parameters()`.
 
-`def thermal_voltage(temperature_k: float) -> float` takes a floating-point
-temperature and returns a floating-point voltage. `-> None` means no return value
-(like `void`). `float | None` means a float or an explicitly missing value.
+The fitter calls `residuals()`. Residuals calls `solve_currents()`, which solves
+the PV equation at every voltage. The difference between each calculated current
+and measured current is returned to the fitter. The Jacobian shows the fitter how
+those errors respond to changes in the five parameters.
 
-`Array` means a NumPy `float64` array, not a Python list. Each function's docstring
-specifies its shape: `(N,)` is N numbers; `(N,5)` is N rows and five columns.
-`Bounds` is a tuple `(lower, upper)` of arrays. `Callable` types specify functions
-passed as arguments. `Literal` types list the accepted method names.
-
-Return types such as `FitResult` are `TypedDict` declarations beside their owning
-functions: they list required dictionary keys and the exact value types. They are
-still ordinary dictionaries, accessed as `result["converged"]`, not C++ objects.
-
-Annotations help type-aware editors/static checkers find mismatches; **Python does
-not enforce them at runtime**. Shapes, units, positivity and finite values still
-need validation and numerical tests. No extra module or framework is required.
-
-All functions are documented in their files. Use NumPy arrays and ordinary dictionaries;
-there is no separate configuration framework.
+The functions use normal NumPy arrays and ordinary dictionaries. Dataset values
+are passed explicitly; no callback wrappers or custom result types are used.
 
 - Parameters always follow `[Iph, I0, Rs, Rsh, n]`, shape `(5,)`.
 - Voltage/current arrays have matching shape `(N,)`, in volts/amperes.
@@ -82,10 +71,9 @@ there is no separate configuration framework.
 - Do not mutate caller arrays. Return failures explicitly; low RMSE alone does not prove
   that all five fitted parameters are physically identifiable.
 
-M2 calls M1's equation. M4 calls M2's predictions. M3 accepts a residual callback
-and calls M4's Jacobian/linear solver. M1's runner connects them; M5 repeats whole fits.
-Implement course algorithms explicitly; NumPy arrays are fine, SciPy optimizers are not
-the implementation. Teammates can test their components with simple fake callbacks.
+M2 calls M1's equation. M4 calls M2's calculated currents. M3 calls M4's
+residual, Jacobian, and linear-solver functions. M1's runner connects them, and
+M5 repeats whole fits. The code passes the dataset and parameters directly.
 
 ## Build in this order
 

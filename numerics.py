@@ -1,64 +1,131 @@
-"""Member 4: residuals, finite differences and explicit linear algebra."""
+"""Residuals, numerical derivatives, and Gaussian elimination."""
 
-from collections.abc import Callable
-from typing import TypeAlias
+import numpy as np
 
-from current import RootMethod
-from model import Array, Bounds
-
-ResidualFunction: TypeAlias = Callable[[Array], Array]  # theta (P,) -> residuals (N,)
+from current import solve_currents
+from model import validate_data, validate_parameters
 
 
 def residuals(
-    theta: Array,
-    voltage: Array,
-    measured_current: Array,
+    theta: np.ndarray,
+    voltage: np.ndarray,
+    measured_current: np.ndarray,
     vt: float,
     ns: int = 1,
-    root_method: RootMethod = "hybrid",
-) -> Array:
-    """Call current.predict_current; return predicted-minus-measured (N,) errors.
-
-    Any failed root raises RuntimeError with point/reason. Do not omit points.
-
-
-    Inputs: theta (5,), voltage/measured_current (N,) [V/A], vt > 0 [V/cell],
-    integer ns >= 1, allowed root_method.
-    Returns: Finite residuals (N,) [A].
-    """
-    raise NotImplementedError("Member 4: residual vector")
+    root_method: str = "hybrid",
+) -> np.ndarray:
+    """Return calculated current minus measured current at every voltage."""
+    validate_data(voltage, measured_current)
+    validate_parameters(theta)
+    result = solve_currents(voltage, theta, vt, ns, root_method)
+    for index, root in enumerate(result["roots"]):
+        if not root["converged"]:
+            raise RuntimeError(f"current solve failed at row {index}: {root['reason']}")
+    errors = result["current"] - measured_current
+    if not np.all(np.isfinite(errors)):
+        raise RuntimeError("residual calculation produced NaN or infinity")
+    return errors
 
 
 def jacobian(
-    residual_fn: ResidualFunction,
-    theta: Array,
-    bounds: Bounds,
-    scales: Array,
+    theta: np.ndarray,
+    voltage: np.ndarray,
+    measured_current: np.ndarray,
+    vt: float,
+    bounds: tuple[np.ndarray, np.ndarray],
+    scales: np.ndarray,
+    ns: int = 1,
+    root_method: str = "hybrid",
     relative_step: float = 1e-6,
-) -> Array:
-    """Return finite-difference (N,P) Jacobian of the residual callback.
+) -> np.ndarray:
+    """Show how every residual changes when each PV parameter changes slightly.
 
-    Start h_j = relative_step * max(abs(theta[j]), scales[j]); scales are positive.
-    Use feasible forward/backward steps at bounds and actual nonzero represented
-    step sizes. Failed evaluations raise RuntimeError, never a fabricated zero column.
-
-
-    Inputs: callback theta(P,)->residuals(N,), theta/scales (P,), bounds=(lower,upper)
-    each (P,), positive scales and finite relative_step > 0.
-    Returns: Jacobian (N,P); P=5 for PV, other sizes allowed for toy tests.
+    Rows represent measured points. Columns represent [Iph, I0, Rs, Rsh, n].
     """
-    raise NotImplementedError("Member 4: finite-difference Jacobian")
+    validate_data(voltage, measured_current)
+    validate_parameters(theta, bounds)
+    lower, upper = bounds
+    if not isinstance(scales, np.ndarray) or scales.shape != theta.shape:
+        raise ValueError("scales must have the same shape as theta")
+    if not np.all(np.isfinite(scales)) or np.any(scales <= 0):
+        raise ValueError("scales must contain positive finite values")
+    if not np.isfinite(relative_step) or relative_step <= 0:
+        raise ValueError("relative_step must be positive")
+
+    base_errors = residuals(theta, voltage, measured_current, vt, ns, root_method)
+    table = np.empty((voltage.size, theta.size), dtype=np.float64)
+
+    for column in range(theta.size):
+        step = relative_step * max(abs(theta[column]), scales[column])
+        forward_theta = theta.copy()
+        backward_theta = theta.copy()
+        forward_theta[column] = min(theta[column] + step, upper[column])
+        backward_theta[column] = max(theta[column] - step, lower[column])
+
+        can_move_forward = forward_theta[column] != theta[column]
+        can_move_backward = backward_theta[column] != theta[column]
+
+        if can_move_forward and can_move_backward:
+            forward_errors = residuals(
+                forward_theta, voltage, measured_current, vt, ns, root_method
+            )
+            backward_errors = residuals(
+                backward_theta, voltage, measured_current, vt, ns, root_method
+            )
+            distance = forward_theta[column] - backward_theta[column]
+            table[:, column] = (forward_errors - backward_errors) / distance
+        elif can_move_forward:
+            forward_errors = residuals(
+                forward_theta, voltage, measured_current, vt, ns, root_method
+            )
+            distance = forward_theta[column] - theta[column]
+            table[:, column] = (forward_errors - base_errors) / distance
+        elif can_move_backward:
+            backward_errors = residuals(
+                backward_theta, voltage, measured_current, vt, ns, root_method
+            )
+            distance = theta[column] - backward_theta[column]
+            table[:, column] = (base_errors - backward_errors) / distance
+        else:
+            raise RuntimeError(f"cannot change parameter {column} inside its bounds")
+
+    return table
 
 
-def solve_linear(matrix: Array, rhs: Array, pivot_rtol: float = 1e-12) -> Array:
-    """Solve A*x=b via Gaussian elimination with partial pivoting/back substitution.
+def solve_linear(
+    matrix: np.ndarray, rhs: np.ndarray, pivot_rtol: float = 1e-12
+) -> np.ndarray:
+    """Solve matrix @ solution = rhs with Gaussian elimination and row swapping."""
+    if not isinstance(matrix, np.ndarray) or not isinstance(rhs, np.ndarray):
+        raise TypeError("matrix and rhs must be NumPy arrays")
+    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("matrix must be square and nonempty")
+    if rhs.shape != (matrix.shape[0],):
+        raise ValueError("rhs length must match the matrix size")
+    if not np.all(np.isfinite(matrix)) or not np.all(np.isfinite(rhs)):
+        raise ValueError("matrix and rhs cannot contain NaN or infinity")
 
-    Copy inputs. Invalid shapes/nonfinite values raise ValueError; numerical
-    singularity raises RuntimeError. Scale pivot checks to matrix magnitude.
-    Do not use numpy.linalg.solve/inv/lstsq or SciPy for this algorithm.
+    work = matrix.astype(np.float64, copy=True)
+    answers = rhs.astype(np.float64, copy=True)
+    size = work.shape[0]
+    minimum_pivot = pivot_rtol * np.max(np.abs(work))
 
+    # Turn the matrix into an upper triangular matrix.
+    for column in range(size):
+        pivot_row = column + int(np.argmax(np.abs(work[column:, column])))
+        if abs(work[pivot_row, column]) <= minimum_pivot:
+            raise RuntimeError("matrix is singular")
+        if pivot_row != column:
+            work[[column, pivot_row]] = work[[pivot_row, column]]
+            answers[[column, pivot_row]] = answers[[pivot_row, column]]
+        for row in range(column + 1, size):
+            multiplier = work[row, column] / work[column, column]
+            work[row, column:] -= multiplier * work[column, column:]
+            answers[row] -= multiplier * answers[column]
 
-    Inputs: Finite matrix (P,P), rhs (P,), finite pivot_rtol > 0.
-    Returns: Solution (P,); no mutation. P=5 for the PV optimizer.
-    """
-    raise NotImplementedError("Member 4: pivoted linear solve")
+    # Work upward from the last row to find every unknown.
+    solution = np.empty(size)
+    for row in range(size - 1, -1, -1):
+        known = work[row, row + 1 :] @ solution[row + 1 :]
+        solution[row] = (answers[row] - known) / work[row, row]
+    return solution

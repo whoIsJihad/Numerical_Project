@@ -1,83 +1,124 @@
-"""Member 1: solar-cell model and measured data."""
+"""Solar-cell equation, dataset loading, and starting parameter values."""
 
 from pathlib import Path
-from typing import TypeAlias
 
 import numpy as np
-from numpy.typing import NDArray
-
-Array: TypeAlias = NDArray[np.float64]  # Required shapes are documented per function.
-Bounds: TypeAlias = tuple[Array, Array]  # (lower, upper), each (P,)
 
 
-def equation(current: float, voltage: float, theta: Array, vt: float, ns: int = 1) -> float:
-    """Return Iph-I0*expm1((V+I*Rs)/(n*ns*vt))-(V+I*Rs)/Rsh-I.
+def validate_data(voltage: np.ndarray, current: np.ndarray) -> None:
+    """Check that voltage and current are matching, usable one-dimensional arrays."""
+    if not isinstance(voltage, np.ndarray) or not isinstance(current, np.ndarray):
+        raise TypeError("voltage and current must be NumPy arrays")
+    if voltage.ndim != 1 or current.ndim != 1:
+        raise ValueError("voltage and current must be one-dimensional")
+    if voltage.size == 0 or current.size == 0:
+        raise ValueError("voltage and current cannot be empty")
+    if voltage.size != current.size:
+        raise ValueError("voltage and current must have the same length")
+    if not np.all(np.isfinite(voltage)) or not np.all(np.isfinite(current)):
+        raise ValueError("voltage and current cannot contain NaN or infinity")
 
-    Zero means the current guess fits the equation. Validate physical inputs;
-    numerical overflow raises RuntimeError. Do not silently clip the exponent.
-    
 
-    Inputs: current [A], voltage [V], theta (5,) ordered [Iph,I0,Rs,Rsh,n], vt > 0 [V/cell], integer ns >= 1.
-    Returns: Scalar equation balance [A].
+def validate_parameters(
+    theta: np.ndarray, bounds: tuple[np.ndarray, np.ndarray] | None = None
+) -> None:
+    """Check the five parameters [Iph, I0, Rs, Rsh, n] and optional limits."""
+    if not isinstance(theta, np.ndarray) or theta.shape != (5,):
+        raise ValueError("theta must be a NumPy array containing five values")
+    if not np.all(np.isfinite(theta)):
+        raise ValueError("theta cannot contain NaN or infinity")
+    iph, i0, rs, rsh, ideality = theta
+    if iph < 0 or i0 <= 0 or rs < 0 or rsh <= 0 or ideality <= 0:
+        raise ValueError("theta contains a physically impossible value")
+    if bounds is None:
+        return
+    if not isinstance(bounds, tuple) or len(bounds) != 2:
+        raise ValueError("bounds must be (lower, upper)")
+    lower, upper = bounds
+    if not isinstance(lower, np.ndarray) or not isinstance(upper, np.ndarray):
+        raise TypeError("lower and upper bounds must be NumPy arrays")
+    if lower.shape != (5,) or upper.shape != (5,):
+        raise ValueError("lower and upper bounds must each contain five values")
+    if not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper)):
+        raise ValueError("bounds cannot contain NaN or infinity")
+    if np.any(lower >= upper):
+        raise ValueError("every lower bound must be less than its upper bound")
+    if np.any(theta < lower) or np.any(theta > upper):
+        raise ValueError("theta lies outside the supplied bounds")
+
+
+def equation(
+    current: float, voltage: float, theta: np.ndarray, vt: float, ns: int = 1
+) -> float:
+    """Return the leftover error after putting a current into the PV equation.
+
+    A result near zero means the current fits this voltage and parameter set.
     """
+    validate_parameters(theta)
+    if not np.isfinite(current) or not np.isfinite(voltage):
+        raise ValueError("current and voltage must be finite")
+    if not np.isfinite(vt) or vt <= 0 or not isinstance(ns, int) or ns < 1:
+        raise ValueError("vt must be positive and ns must be a positive integer")
+    iph, i0, rs, rsh, ideality = theta
+    diode_voltage = voltage + current * rs
+    exponent = diode_voltage / (ideality * ns * vt)
+    with np.errstate(over="raise", invalid="raise"):
+        try:
+            answer = iph - i0 * np.expm1(exponent) - diode_voltage / rsh - current
+        except FloatingPointError as error:
+            raise RuntimeError("PV equation overflowed") from error
+    return float(answer)
 
-    
-    raise NotImplementedError("Member 1: equation")
 
-
-def current_derivative(current: float, voltage: float, theta: Array, vt: float, ns: int = 1) -> float:
-    """Return the equation's derivative with respect to current, not parameters.
-
-    Inputs: current [A], voltage [V], theta (5,), vt > 0 [V/cell], integer ns >= 1.
-    Returns: Scalar derivative of equation balance with respect to current [A/A].
-    """
-    raise NotImplementedError("Member 1: current derivative")
+def current_derivative(
+    current: float, voltage: float, theta: np.ndarray, vt: float, ns: int = 1
+) -> float:
+    """Return the slope that Newton's method needs for its next current guess."""
+    validate_parameters(theta)
+    _, i0, rs, rsh, ideality = theta
+    exponent = (voltage + current * rs) / (ideality * ns * vt)
+    with np.errstate(over="raise", invalid="raise"):
+        try:
+            slope = -i0 * np.exp(exponent) * rs / (ideality * ns * vt) - rs / rsh - 1
+        except FloatingPointError as error:
+            raise RuntimeError("PV derivative overflowed") from error
+    return float(slope)
 
 
 def thermal_voltage(temperature_k: float) -> float:
-    """Return per-cell k*T/q; reject nonfinite/nonpositive temperature.
-
-    Inputs: Finite temperature_k > 0 [K].
-    Returns: Per-cell thermal voltage [V].
-    """
-    raise NotImplementedError("Member 1: thermal voltage")
-
-
-def load_data(path: str | Path) -> tuple[Array, Array]:
-    """Read voltage_v,current_a CSV columns; return validated (voltage, current) arrays.
-
-    Inputs: CSV file path.
-    Returns: (voltage [V], current [A]), each finite (N,), N > 0; file errors propagate.
-    """
-    raise NotImplementedError("Member 1: CSV loading")
+    """Calculate thermal voltage vt from temperature in kelvin."""
+    if not np.isfinite(temperature_k) or temperature_k <= 0:
+        raise ValueError("temperature must be finite and greater than zero")
+    boltzmann_constant = 1.380649e-23
+    electron_charge = 1.602176634e-19
+    return boltzmann_constant * temperature_k / electron_charge
 
 
-def validate_data(voltage: Array, current: Array) -> None:
-    """Require nonempty, finite, matching 1-D arrays; ValueError otherwise.
-
-    Inputs: voltage [V], current [A], both finite (N,), N > 0.
-    Returns: None on success; ValueError on invalid input. No mutation.
-    """
-    raise NotImplementedError("Member 1: data validation")
-
-
-def validate_parameters(theta: Array, bounds: Bounds | None = None) -> None:
-    """Check shape (5,), finite physical values and optional (lower, upper) bounds.
-
-    Inputs: theta (5,), optional bounds=(lower,upper), each finite (5,).
-    Returns: None on success; ValueError on invalid input. No mutation.
-    """
-    raise NotImplementedError("Member 1: parameter validation")
+def load_data(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load voltage_v and current_a from the CSV file named by path."""
+    data = np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.float64)
+    if data.ndim != 2 or data.shape[1] != 2:
+        raise ValueError("CSV must contain exactly two columns")
+    voltage = data[:, 0]
+    current = data[:, 1]
+    validate_data(voltage, current)
+    return voltage, current
 
 
-def initial_parameters(voltage: Array, current: Array, vt: float, ns: int = 1) -> tuple[Array, Bounds, Array]:
-    """Return (theta0, bounds, scales) using documented dataset-specific heuristics.
-
-    Bounds are two finite (5,) arrays. Scales are positive (5,) typical magnitudes
-    used for finite differences and step tests. Starting theta must be feasible.
-    
-
-    Inputs: voltage/current (N,) [V/A], vt > 0 [V/cell], integer ns >= 1.
-    Returns: (theta0 (5,), (lower (5,), upper (5,)), positive scales (5,)).
-    """
-    raise NotImplementedError("Member 1: starting parameters")
+def initial_parameters(
+    voltage: np.ndarray, current: np.ndarray, vt: float, ns: int = 1
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray], np.ndarray]:
+    """Return a reasonable starting point, limits, and step sizes for fitting."""
+    validate_data(voltage, current)
+    if not np.isfinite(vt) or vt <= 0:
+        raise ValueError("vt must be finite and greater than zero")
+    if not isinstance(ns, int) or ns < 1:
+        raise ValueError("ns must be a positive integer")
+    # These limits come from the French RTC single-cell dataset used here.
+    theta0 = np.array([max(current), 5e-7, 0.1, 50.0, 1.5], dtype=np.float64)
+    lower = np.array([0.0, 1e-12, 0.0, 1.0, 1.0], dtype=np.float64)
+    upper = np.array([1.0, 1e-6, 0.5, 100.0, 2.0], dtype=np.float64)
+    scales = np.array([1.0, 1e-6, 0.1, 50.0, 1.0], dtype=np.float64)
+    bounds = (lower, upper)
+    validate_parameters(theta0, bounds)
+    return theta0, bounds, scales

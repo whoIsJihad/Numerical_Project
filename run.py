@@ -1,54 +1,51 @@
-"""Member 1: wire the pipeline; do not duplicate the numerical algorithms."""
+"""Load the RTC dataset and run the complete parameter-fitting pipeline."""
 
-from typing import TypedDict
+import numpy as np
 
-from current import RootMethod
-from fit import FitMethod, FitResult
-from model import Array, Bounds
-
-
-class BaselineResult(TypedDict):
-    fit: FitResult
-    rmse: float | None  # [A], None when fit did not converge
+from experiments import rmse
+from fit import fit_parameters
+from model import initial_parameters, load_data, thermal_voltage, validate_data
 
 
 def run_baseline(
-    voltage: Array,
-    current: Array,
+    voltage: np.ndarray,
+    current: np.ndarray,
     vt: float,
-    theta0: Array,
-    bounds: Bounds,
-    scales: Array,
+    theta0: np.ndarray,
+    bounds: tuple[np.ndarray, np.ndarray],
+    scales: np.ndarray,
     ns: int = 1,
-    root_method: RootMethod = "hybrid",
-    fit_method: FitMethod = "lm",
-) -> BaselineResult:
-    """Return {"fit": fit result, "rmse": value or None}.
-
-    Validate inputs. Bind numerics.residuals into a callback accepting only theta.
-    Pass that callback to fit.fit_parameters. Call experiments.rmse only if
-    the fit converged. A failed fit has rmse=None.
-
-
-    Inputs: voltage/current (N,) [V/A], vt > 0 [V/cell], theta0/scales (5,),
-    bounds=(lower,upper) each (5,), integer ns >= 1, allowed method names.
-    Returns: BaselineResult with fit diagnostics and optional RMSE; no input mutation.
-    """
-    raise NotImplementedError("Member 1: connect the pipeline")
+    root_method: str = "hybrid",
+    fit_method: str = "lm",
+) -> dict:
+    """Run one fit and return its details and final RMSE."""
+    validate_data(voltage, current)
+    fit = fit_parameters(
+        voltage,
+        current,
+        vt,
+        theta0,
+        bounds,
+        scales,
+        ns,
+        root_method,
+        fit_method,
+    )
+    final_rmse = rmse(fit["residuals"]) if fit["converged"] else None
+    return {"fit": fit, "rmse": final_rmse}
 
 
 def main() -> None:
-    """Read CSV/temperature/settings, get starting parameters, run and report.
+    """Load the French RTC data, fit its parameters, and print the result."""
+    voltage, current = load_data("data/rtc_france.csv")
+    vt = thermal_voltage(306.15)
+    theta0, bounds, scales = initial_parameters(voltage, current, vt, ns=1)
+    result = run_baseline(voltage, current, vt, theta0, bounds, scales)
 
-    Begin with one baseline fit. Later offer a noise-study option using Member 5's
-    monte_carlo and a fixed-start fit callback. Report failures honestly and
-    exit nonzero for failed baseline runs. No argument parser is implemented yet.
-
-
-    Inputs: No Python arguments; future CLI arguments come from the command line.
-    Returns: None; displays/saves results; nonzero exit on baseline failure.
-    """
-    raise NotImplementedError("Member 1: entry point")
+    print("Converged:", result["fit"]["converged"])
+    print("Reason:", result["fit"]["reason"])
+    print("Parameters [Iph, I0, Rs, Rsh, n]:", result["fit"]["theta"])
+    print("RMSE (A):", result["rmse"])
 
 
 if __name__ == "__main__":
